@@ -4,19 +4,32 @@
 # ----------------------
 # Interactive creator for macOS bootable USB install drives.
 #
-#   1. Lists the macOS installers Apple currently offers and lets you pick one.
-#   2. Downloads it (or reuses one already in /Applications).
-#   3. Lists your external USB drives and lets you pick the target.
-#   4. Erases + formats the drive, then runs Apple's `createinstallmedia`.
-#   5. Verifies the result and tells you it's safe to boot from.
+#   1. Lists the macOS installers available to download (stable AND betas your
+#      Mac is enrolled for) and lets you pick one.
+#   2. Lists your external USB drives and lets you pick the target.
+#   3. After an explicit confirmation, formats the drive, downloads the FULL
+#      installer in the background, and writes the bootable installer to it.
+#   4. Verifies the result and tells you it's safe to boot from.
+#
+# Why mist instead of `softwareupdate --fetch-full-installer`?
+#   `softwareupdate --fetch-full-installer` is unreliable for beta releases: it
+#   frequently writes a ~20 MB *stub* app (empty SharedSupport) that then makes
+#   you click through a GUI download. `createinstallmedia` rejects that stub with
+#   "does not appear to be a valid OS installer application". mist (mist-cli)
+#   downloads the genuine full installer non-interactively, betas included, so
+#   the whole thing runs unattended after you enter your password.
 #
 # Usage:
 #   ./make-macos-boot-usb.sh            # do it for real
 #   ./make-macos-boot-usb.sh --dry-run  # walk the whole flow, but change nothing
+#   ./make-macos-boot-usb.sh --help
 #
 # Only external, physical disks can ever be selected as the target, so your
 # internal startup disk is never a candidate. You still get a final, explicit,
 # type-the-word-ERASE confirmation before anything is written.
+#
+# Requirements: macOS, Homebrew (to install mist automatically), admin rights,
+# and a 32 GB+ USB drive (recent installers are ~17 GB; 16 GB is too small).
 
 set -uo pipefail
 
@@ -38,7 +51,7 @@ err()  { printf '%s  ✗%s %s\n'  "$RED" "$RST" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 
 # ---------------------------------------------------------------------------
-# Dry-run plumbing
+# Options
 # ---------------------------------------------------------------------------
 DRY_RUN=0
 case "${1:-}" in
@@ -59,8 +72,7 @@ run() {
   "$@"
 }
 
-# ask_index <count> <prompt> : read a menu number in 1..count (or the given
-# minimum). Echoes the chosen number on stdout. Re-prompts until valid.
+# ask_index <count> <prompt> [min] : read a menu number in [min..count].
 ask_index() {
   local count="$1" prompt="$2" min="${3:-1}" reply
   while true; do
@@ -73,100 +85,97 @@ ask_index() {
   done
 }
 
-cleanup() { printf '\n'; }
-trap cleanup INT TERM
+WORKDIR=""
+cleanup() {
+  [[ -n "$WORKDIR" && -d "$WORKDIR" ]] && rm -rf "$WORKDIR" 2>/dev/null
+}
+trap cleanup EXIT INT TERM
 
 # ---------------------------------------------------------------------------
 # Sanity checks
 # ---------------------------------------------------------------------------
 [[ "$(uname -s)" == "Darwin" ]] || die "This script only runs on macOS."
-command -v softwareupdate >/dev/null || die "'softwareupdate' not found."
-command -v diskutil       >/dev/null || die "'diskutil' not found."
+command -v diskutil >/dev/null || die "'diskutil' not found."
+WORKDIR="$(mktemp -d -t makemacosusb)" || die "Could not create a temp directory."
 
 printf '%s%s macOS Boot USB Creator %s\n' "$BOLD" "$BLU" "$RST"
 [[ $DRY_RUN -eq 1 ]] && warn "DRY-RUN MODE: nothing will be downloaded, erased, or written."
 
+# ---------------------------------------------------------------------------
+# Ensure mist (mist-cli) is available
+# ---------------------------------------------------------------------------
+ensure_mist() {
+  command -v mist >/dev/null && return 0
+  warn "mist (mist-cli) is required to download full macOS installers, and isn't installed."
+  if command -v brew >/dev/null; then
+    printf '  Install it now with Homebrew (brew install mist-cli)? [Y/n]: '
+    local r; read -r r || r=""
+    if [[ ! "$r" =~ ^[Nn] ]]; then
+      brew install mist-cli || die "Homebrew failed to install mist-cli."
+    fi
+  fi
+  command -v mist >/dev/null || die "Please install mist first: brew install mist-cli  (https://github.com/ninxsoft/mist-cli)"
+}
+if [[ $DRY_RUN -eq 0 ]]; then
+  ensure_mist
+elif ! command -v mist >/dev/null; then
+  warn "mist not installed; this dry-run can't fetch the installer list."
+fi
+
+# The catalog URL your Mac is configured for. When you're enrolled in a beta
+# seed, this points at the seed catalog, which is how beta installers become
+# visible to mist. Empty on a stock config (mist then uses its own default).
+CATALOG="$(defaults read /Library/Preferences/com.apple.SoftwareUpdate CatalogURL 2>/dev/null || true)"
+CAT_ARGS=()
+if [[ -n "$CATALOG" ]]; then
+  CAT_ARGS=(--catalog-url "$CATALOG")
+  info "Using your system's software catalog (any beta-seed installers will be visible)."
+fi
+
 # ===========================================================================
 # 1. Choose a macOS version
 # ===========================================================================
-step "Asking Apple which macOS installers are available…"
-RAW="$(softwareupdate --list-full-installers 2>/dev/null)"
-[[ -n "$RAW" ]] || die "Couldn't get the installer list from softwareupdate."
+step "Asking mist which macOS installers are available…"
+CSV="$WORKDIR/list.csv"
+if command -v mist >/dev/null; then
+  mist list installer "${CAT_ARGS[@]}" --include-betas --export "$CSV" --output-type csv --no-ansi >/dev/null 2>&1 \
+    || die "mist could not fetch the installer list. Check your network connection."
+fi
+[[ -s "$CSV" ]] || die "No installer list was produced by mist."
 
-titles=(); versions=(); builds=(); sizes_kib=()
-while IFS= read -r line; do
-  case "$line" in *Title:*Version:*) ;; *) continue ;; esac
-  t="${line#*Title: }";   t="${t%%, Version:*}"
-  v="${line#*Version: }"; v="${v%%,*}"
-  b="${line#*Build: }";   b="${b%%,*}"
-  s="${line#*Size: }";    s="${s%%,*}"; s="${s%KiB}"
-  titles+=("$t"); versions+=("$v"); builds+=("$b"); sizes_kib+=("$s")
-done <<< "$RAW"
+# mist's CSV columns: Identifier,Name,Version,Build,Size,Date,Compatible,Beta
+# Version/Build come Excel-quoted as ="27.0"; strip quotes and a leading '='.
+names=(); vers=(); builds=(); szbytes=(); betaflags=()
+while IFS=$'\t' read -r nm ver bld sz bta; do
+  [[ -z "$bld" ]] && continue
+  names+=("$nm"); vers+=("$ver"); builds+=("$bld"); szbytes+=("$sz"); betaflags+=("$bta")
+done < <(awk -F',' 'NR>1{
+    for (i=1;i<=NF;i++){ gsub(/"/,"",$i); sub(/^=/,"",$i) }
+    print $2"\t"$3"\t"$4"\t"$5"\t"$8
+}' "$CSV")
 
-(( ${#titles[@]} > 0 )) || die "No installers were parsed from softwareupdate output."
+(( ${#builds[@]} > 0 )) || die "Could not parse any installers from mist's output."
 
 echo
-printf '    %s%-3s %-32s %-9s %-11s %s%s\n' "$DIM" "#" "Title" "Version" "Build" "Approx size" "$RST"
-for i in "${!titles[@]}"; do
-  gb="$(awk -v k="${sizes_kib[$i]}" 'BEGIN{printf "%.1f GB", k*1024/1e9}')"
-  printf '    %-3s %-32s %-9s %-11s %s\n' \
-    "$((i+1))" "${titles[$i]}" "${versions[$i]}" "${builds[$i]}" "$gb"
+printf '    %s%-3s %-26s %-9s %-11s %-10s %s%s\n' "$DIM" "#" "Name" "Version" "Build" "Size" "Type" "$RST"
+for i in "${!builds[@]}"; do
+  gb="$(awk -v b="${szbytes[$i]}" 'BEGIN{printf "%.1f GB", b/1e9}')"
+  tag=""; [[ "${betaflags[$i]}" == "YES" ]] && tag="beta"
+  printf '    %-3s %-26s %-9s %-11s %-10s %s\n' \
+    "$((i+1))" "${names[$i]}" "${vers[$i]}" "${builds[$i]}" "$gb" "$tag"
 done
 echo
-sel="$(ask_index "${#titles[@]}" "  Which macOS do you want to build a USB for? (number): ")"
+sel="$(ask_index "${#builds[@]}" "  Which macOS do you want to build a USB for? (number): ")"
 sel=$((sel-1))
 
-SEL_TITLE="${titles[$sel]}"
-SEL_VER="${versions[$sel]}"
+SEL_NAME="${names[$sel]}"
+SEL_VER="${vers[$sel]}"
 SEL_BUILD="${builds[$sel]}"
-SEL_KIB="${sizes_kib[$sel]}"
-SEL_NEEDED_BYTES="$(awk -v k="$SEL_KIB" 'BEGIN{printf "%.0f", k*1024}')"
-ok "Selected: ${BOLD}${SEL_TITLE}${RST} (version $SEL_VER, build $SEL_BUILD)"
+SEL_BYTES="${szbytes[$sel]}"
+ok "Selected: ${BOLD}${SEL_NAME}${RST} (version $SEL_VER, build $SEL_BUILD, $(awk -v b="$SEL_BYTES" 'BEGIN{printf "%.1f GB", b/1e9}'))"
 
 # ===========================================================================
-# 2. Obtain the installer app (download, or reuse an existing one)
-# ===========================================================================
-step "Preparing the installer application…"
-
-existing=()
-while IFS= read -r -d '' app; do
-  existing+=("$app")
-done < <(find /Applications -maxdepth 1 -name 'Install macOS*.app' -print0 2>/dev/null)
-
-echo "    0) Download \"$SEL_TITLE\" ($SEL_VER) now with softwareupdate"
-for i in "${!existing[@]}"; do
-  printf '    %s) Reuse existing: %s\n' "$((i+1))" "$(basename "${existing[$i]}")"
-done
-echo
-choice="$(ask_index "${#existing[@]}" "  Choose the installer source (number): " 0)"
-
-INSTALLER_APP=""
-if (( choice == 0 )); then
-  dl_gb="$(awk -v k="$SEL_KIB" 'BEGIN{printf "%.0f", k*1024/1e9}')"
-  info "Downloading — this is a large (~${dl_gb}GB) download and may take a while."
-  run softwareupdate --fetch-full-installer --full-installer-version "$SEL_VER" \
-    || die "Download failed. If this is a beta, enable it in System Settings › General › Software Update, then retry."
-  if [[ $DRY_RUN -eq 1 ]]; then
-    INSTALLER_APP="/Applications/Install macOS ${SEL_TITLE#macOS }.app"
-  else
-    # The freshly-downloaded app is the newest Install macOS*.app in /Applications.
-    while IFS= read -r -d '' app; do
-      [[ -z "$INSTALLER_APP" || "$app" -nt "$INSTALLER_APP" ]] && INSTALLER_APP="$app"
-    done < <(find /Applications -maxdepth 1 -name 'Install macOS*.app' -print0 2>/dev/null)
-  fi
-else
-  INSTALLER_APP="${existing[$((choice-1))]}"
-fi
-
-[[ -n "$INSTALLER_APP" ]] || die "Could not locate the installer application."
-CIM="$INSTALLER_APP/Contents/Resources/createinstallmedia"
-if [[ $DRY_RUN -eq 0 ]]; then
-  [[ -x "$CIM" ]] || die "createinstallmedia not found inside $INSTALLER_APP"
-fi
-ok "Using installer: $INSTALLER_APP"
-
-# ===========================================================================
-# 3. Choose the target USB drive
+# 2. Choose the target USB drive
 # ===========================================================================
 step "Looking for external USB drives…"
 
@@ -195,22 +204,21 @@ while (( ${#disks[@]} == 0 )); do
   scan_disks
 done
 
-# Gather human-readable info for each candidate disk.
-names=(); sizes_h=(); bytes=(); protos=()
+names_d=(); sizes_h=(); bytes_d=(); protos=()
 for d in "${disks[@]}"; do
   di="$(diskutil info "/dev/$d" 2>/dev/null)"
   nm="$(awk -F': +' '/Device \/ Media Name/{print $2; exit}' <<< "$di")"
   sz="$(awk -F': +' '/Disk Size/{print $2; exit}'          <<< "$di")"
   by="$(grep -oE '\(([0-9]+) Bytes\)' <<< "$di" | grep -oE '[0-9]+' | head -1)"
   pr="$(awk -F': +' '/Protocol/{print $2; exit}'           <<< "$di")"
-  names+=("${nm:-Unknown}"); sizes_h+=("${sz%% (*}"); bytes+=("${by:-0}"); protos+=("${pr:-?}")
+  names_d+=("${nm:-Unknown}"); sizes_h+=("${sz%% (*}"); bytes_d+=("${by:-0}"); protos+=("${pr:-?}")
 done
 
 echo
 printf '    %s%-3s %-9s %-28s %-11s %s%s\n' "$DIM" "#" "Device" "Name" "Size" "Bus" "$RST"
 for i in "${!disks[@]}"; do
   printf '    %-3s /dev/%-4s %-28s %-11s %s\n' \
-    "$((i+1))" "${disks[$i]}" "${names[$i]}" "${sizes_h[$i]}" "${protos[$i]}"
+    "$((i+1))" "${disks[$i]}" "${names_d[$i]}" "${sizes_h[$i]}" "${protos[$i]}"
 done
 echo
 warn "Everything on the chosen drive will be destroyed."
@@ -218,51 +226,55 @@ usb="$(ask_index "${#disks[@]}" "  Which drive is your target USB? (number): ")"
 usb=$((usb-1))
 
 SEL_DISK="${disks[$usb]}"
-SEL_NAME="${names[$usb]}"
+SEL_DNAME="${names_d[$usb]}"
 SEL_DSIZE="${sizes_h[$usb]}"
-SEL_DBYTES="${bytes[$usb]}"
+SEL_DBYTES="${bytes_d[$usb]}"
 
-# Capacity check against the *actual* installer size (not the article's 16GB myth).
-if (( SEL_DBYTES > 0 && SEL_DBYTES < SEL_NEEDED_BYTES )); then
-  need_gb="$(awk -v b="$SEL_NEEDED_BYTES" 'BEGIN{printf "%.1f", b/1e9}')"
-  have_gb="$(awk -v b="$SEL_DBYTES"      'BEGIN{printf "%.1f", b/1e9}')"
+# Capacity check against the *actual* installer size.
+if (( SEL_DBYTES > 0 && SEL_DBYTES < SEL_BYTES )); then
+  need_gb="$(awk -v b="$SEL_BYTES"  'BEGIN{printf "%.1f", b/1e9}')"
+  have_gb="$(awk -v b="$SEL_DBYTES" 'BEGIN{printf "%.1f", b/1e9}')"
   die "This drive is too small: it holds ${have_gb}GB but the installer needs about ${need_gb}GB. Use a 32GB drive."
 fi
-ok "Target: /dev/$SEL_DISK ($SEL_NAME, $SEL_DSIZE)"
+ok "Target: /dev/$SEL_DISK ($SEL_DNAME, $SEL_DSIZE)"
 
 # ===========================================================================
-# 4. Final confirmation
+# 3. Final confirmation
 # ===========================================================================
 step "FINAL CONFIRMATION"
-printf '    This will %sPERMANENTLY ERASE%s /dev/%s (%s, %s)\n' "$RED$BOLD" "$RST" "$SEL_DISK" "$SEL_NAME" "$SEL_DSIZE"
-printf '    and turn it into a bootable installer for %s%s %s%s.\n' "$BOLD" "$SEL_TITLE" "$SEL_VER" "$RST"
+printf '    This will %sPERMANENTLY ERASE%s /dev/%s (%s, %s)\n' "$RED$BOLD" "$RST" "$SEL_DISK" "$SEL_DNAME" "$SEL_DSIZE"
+printf '    and turn it into a bootable installer for %s%s %s%s.\n' "$BOLD" "$SEL_NAME" "$SEL_VER" "$RST"
 echo
 printf '  Type %sERASE%s to proceed (anything else cancels): ' "$BOLD" "$RST"
 read -r confirm || exit 1
 [[ "$confirm" == "ERASE" ]] || die "Cancelled — nothing was changed."
 
-# Cache the admin password once so the erase + createinstallmedia run smoothly.
 if [[ $DRY_RUN -eq 0 ]]; then
   info "Administrator access is required to erase the disk and write the installer."
   sudo -v || die "Could not obtain administrator privileges."
 fi
 
 # ===========================================================================
-# 5. Erase + build the boot media
+# 4. Format, then download + build (all unattended)
 # ===========================================================================
-VOLNAME="MacInstaller"   # temporary; createinstallmedia renames it afterwards.
+VOLNAME="MacInstaller"   # mist requires a Mac OS Extended (Journaled) volume;
+                         # it re-erases and renames it during the build.
 
 step "Erasing and formatting /dev/$SEL_DISK as Mac OS Extended (Journaled), GUID…"
 run sudo diskutil eraseDisk JHFS+ "$VOLNAME" GPT "/dev/$SEL_DISK" \
   || die "Failed to erase the disk. Is it still connected / not in use?"
 
-step "Writing the installer with createinstallmedia (can take 20–40 minutes)…"
-info "It will erase the volume again, copy files, then make the disk bootable."
-run sudo "$CIM" --volume "/Volumes/$VOLNAME" --nointeraction \
-  || die "createinstallmedia failed. The USB is NOT bootable; re-run to try again."
+step "Downloading the full installer and building the boot USB with mist…"
+info "This downloads ~$(awk -v b="$SEL_BYTES" 'BEGIN{printf "%.0f", b/1e9}')GB in the background (no clicking),"
+info "then erases the volume again and makes it bootable. Expect 20–40 minutes."
+run sudo mist download installer "$SEL_BUILD" bootableinstaller \
+  --bootable-installer-volume "/Volumes/$VOLNAME" \
+  "${CAT_ARGS[@]}" \
+  --include-betas \
+  || die "mist failed to build the installer. The USB is NOT bootable; re-run to try again."
 
 # ===========================================================================
-# 6. Verify + finish
+# 5. Verify + finish
 # ===========================================================================
 step "Verifying…"
 if [[ $DRY_RUN -eq 1 ]]; then
@@ -277,12 +289,11 @@ while IFS= read -r -d '' v; do FINAL_VOL="$v"; done \
 if [[ -n "$FINAL_VOL" ]]; then
   ok "Boot installer created and mounted at: $FINAL_VOL"
 else
-  warn "createinstallmedia reported success but I couldn't see the mounted volume."
-  warn "Check 'diskutil list' — it may simply have been renamed."
+  warn "mist reported success but I couldn't see the mounted volume — check 'diskutil list'."
 fi
 
 echo
-ok "${BOLD}Your ${SEL_TITLE} boot USB is ready and safe to boot from.${RST}"
+ok "${BOLD}Your ${SEL_NAME} boot USB is ready and safe to boot from.${RST}"
 info "To boot an Apple Silicon Mac from it:"
 info "  1. Shut the Mac down."
 info "  2. Press and HOLD the power button until 'Loading startup options' appears."
