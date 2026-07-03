@@ -292,6 +292,25 @@ else
   warn "mist reported success but I couldn't see the mounted volume — check 'diskutil list'."
 fi
 
+# We deliberately don't pass --cache-downloads, so mist removes its ~17 GB
+# temporary download on its own. This is an explicit safety net in case anything
+# was left behind (only acts, and only asks for your password, if >100 MB remains).
+MIST_TMP="/private/tmp/com.ninxsoft.mist"
+if [[ -d "$MIST_TMP" ]]; then
+  leftover_kb="$(du -sk "$MIST_TMP" 2>/dev/null | cut -f1)"
+  if [[ "${leftover_kb:-0}" -gt 102400 ]]; then
+    human="$(du -sh "$MIST_TMP" 2>/dev/null | cut -f1)"
+    info "Removing leftover temporary download (${human})…"
+    if sudo rm -rf "$MIST_TMP" 2>/dev/null; then
+      ok "Temporary download files removed."
+    else
+      warn "Couldn't remove $MIST_TMP — delete it manually to reclaim the space."
+    fi
+  else
+    ok "No temporary download left behind (mist already cleaned it up)."
+  fi
+fi
+
 echo
 ok "${BOLD}Your ${SEL_NAME} boot USB is ready and safe to boot from.${RST}"
 info "To boot an Apple Silicon Mac from it:"
