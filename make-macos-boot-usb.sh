@@ -72,6 +72,21 @@ run() {
   "$@"
 }
 
+# detach_mist_scratch : mist sometimes fails to unmount its own scratch disk
+# image at teardown ("hdiutil … Resource busy", usually Spotlight indexing it),
+# which leaves it mounted and makes mist exit non-zero. Detach any such image so
+# it doesn't accumulate. Best-effort — every failure is swallowed.
+detach_mist_scratch() {
+  [[ $DRY_RUN -eq 1 ]] && return 0
+  local dev
+  while IFS= read -r dev; do
+    [[ -n "$dev" ]] && sudo diskutil eject force "$dev" >/dev/null 2>&1 || true
+  done < <(hdiutil info 2>/dev/null | awk '
+      /^====/                   { m=0 }
+      /^image-path/             { m = ($0 ~ /com\.ninxsoft\.mist/) ? 1 : 0 }
+      /^\/dev\/disk[0-9]+[ \t]/ { if (m) print $1 }')
+}
+
 # ask_index <count> <prompt> [min] : read a menu number in [min..count].
 ask_index() {
   local count="$1" prompt="$2" min="${3:-1}" reply
@@ -273,21 +288,34 @@ step "Downloading the full installer with mist…"
 info "This downloads ~$(awk -v b="$SEL_BYTES" 'BEGIN{printf "%.0f", b/1e9}')GB in the background (no clicking)."
 info "Expect 10–30 minutes depending on your connection."
 run mkdir -p "$APPDIR"
-run sudo mist download installer "$SEL_BUILD" application \
-  --output-directory "$APPDIR" \
-  "${CAT_ARGS[@]}" \
-  --include-betas \
-  || die "mist failed to download the installer. Check your network and re-run."
+detach_mist_scratch                       # clear any scratch image a prior run left mounted
 
-# Locate the .app mist just produced (its name follows the macOS version).
+# IMPORTANT: mist frequently exits non-zero here because it fails to UNMOUNT its
+# own scratch disk image at teardown ("hdiutil … Resource busy", exit 16) —
+# Spotlight starts indexing the image the instant it appears. By that point the
+# installer .app has ALREADY been copied into $APPDIR successfully, so a non-zero
+# exit is NOT necessarily a real failure. Judge success by whether a complete,
+# usable .app actually landed — not by mist's exit code.
 if [[ $DRY_RUN -eq 1 ]]; then
+  run sudo mist download installer "$SEL_BUILD" application \
+    --output-directory "$APPDIR" "${CAT_ARGS[@]}" --include-betas
   INSTALLER_APP="$APPDIR/Install ${SEL_NAME}.app"
 else
+  sudo mist download installer "$SEL_BUILD" application \
+    --output-directory "$APPDIR" \
+    "${CAT_ARGS[@]}" \
+    --include-betas \
+    || warn "mist exited non-zero (usually just a failed cleanup of its scratch image) — verifying the installer was produced anyway…"
+  detach_mist_scratch                     # tidy up the scratch image mist left mounted
+
   INSTALLER_APP=""
   while IFS= read -r -d '' a; do INSTALLER_APP="$a"; done \
     < <(find "$APPDIR" -maxdepth 1 -name 'Install*.app' -print0 2>/dev/null)
-  [[ -n "$INSTALLER_APP" && -x "$INSTALLER_APP/Contents/Resources/createinstallmedia" ]] \
-    || die "The downloaded installer looks incomplete (no createinstallmedia in $APPDIR)."
+  [[ -n "$INSTALLER_APP" \
+     && -x "$INSTALLER_APP/Contents/Resources/createinstallmedia" \
+     && -f "$INSTALLER_APP/Contents/SharedSupport/SharedSupport.dmg" ]] \
+    || die "mist did not produce a complete installer in $APPDIR. Re-run to try again."
+  ok "Installer ready: $(basename "$INSTALLER_APP")"
 fi
 
 step "Erasing and formatting /dev/$SEL_DISK as Mac OS Extended (Journaled), GUID…"
