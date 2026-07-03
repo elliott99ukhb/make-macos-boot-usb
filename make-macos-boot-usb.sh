@@ -7,8 +7,8 @@
 #   1. Lists the macOS installers available to download (stable AND betas your
 #      Mac is enrolled for) and lets you pick one.
 #   2. Lists your external USB drives and lets you pick the target.
-#   3. After an explicit confirmation, formats the drive, downloads the FULL
-#      installer in the background, and writes the bootable installer to it.
+#   3. After an explicit confirmation, downloads the FULL installer, formats the
+#      drive, and writes it into a bootable installer with createinstallmedia.
 #   4. Verifies the result and tells you it's safe to boot from.
 #
 # Why mist instead of `softwareupdate --fetch-full-installer`?
@@ -255,23 +255,53 @@ if [[ $DRY_RUN -eq 0 ]]; then
 fi
 
 # ===========================================================================
-# 4. Format, then download + build (all unattended)
+# 4. Download the installer, format the USB, then write it (all unattended)
 # ===========================================================================
-VOLNAME="MacInstaller"   # mist requires a Mac OS Extended (Journaled) volume;
-                         # it re-erases and renames it during the build.
+VOLNAME="MacInstaller"   # createinstallmedia wants a Mac OS Extended (Journaled)
+                         # volume; it re-erases and renames it while writing.
+
+# NOTE: we deliberately do NOT use mist's "bootableinstaller" output type. That
+# path drives Apple's createinstallmedia through a mist wrapper that currently
+# fails on macOS 26/27 with:
+#     Invalid Exit Status Code: '254' … is not a valid volume mount point
+# even though createinstallmedia itself works perfectly on the same drive. So we
+# let mist do only the part it's reliable at — downloading the genuine full
+# installer .app — and then call Apple's createinstallmedia directly.
+APPDIR="$WORKDIR/installer"
+
+step "Downloading the full installer with mist…"
+info "This downloads ~$(awk -v b="$SEL_BYTES" 'BEGIN{printf "%.0f", b/1e9}')GB in the background (no clicking)."
+info "Expect 10–30 minutes depending on your connection."
+run mkdir -p "$APPDIR"
+run sudo mist download installer "$SEL_BUILD" application \
+  --output-directory "$APPDIR" \
+  "${CAT_ARGS[@]}" \
+  --include-betas \
+  || die "mist failed to download the installer. Check your network and re-run."
+
+# Locate the .app mist just produced (its name follows the macOS version).
+if [[ $DRY_RUN -eq 1 ]]; then
+  INSTALLER_APP="$APPDIR/Install ${SEL_NAME}.app"
+else
+  INSTALLER_APP=""
+  while IFS= read -r -d '' a; do INSTALLER_APP="$a"; done \
+    < <(find "$APPDIR" -maxdepth 1 -name 'Install*.app' -print0 2>/dev/null)
+  [[ -n "$INSTALLER_APP" && -x "$INSTALLER_APP/Contents/Resources/createinstallmedia" ]] \
+    || die "The downloaded installer looks incomplete (no createinstallmedia in $APPDIR)."
+fi
 
 step "Erasing and formatting /dev/$SEL_DISK as Mac OS Extended (Journaled), GUID…"
 run sudo diskutil eraseDisk JHFS+ "$VOLNAME" GPT "/dev/$SEL_DISK" \
   || die "Failed to erase the disk. Is it still connected / not in use?"
 
-step "Downloading the full installer and building the boot USB with mist…"
-info "This downloads ~$(awk -v b="$SEL_BYTES" 'BEGIN{printf "%.0f", b/1e9}')GB in the background (no clicking),"
-info "then erases the volume again and makes it bootable. Expect 20–40 minutes."
-run sudo mist download installer "$SEL_BUILD" bootableinstaller \
-  --bootable-installer-volume "/Volumes/$VOLNAME" \
-  "${CAT_ARGS[@]}" \
-  --include-betas \
-  || die "mist failed to build the installer. The USB is NOT bootable; re-run to try again."
+step "Writing the bootable installer with Apple's createinstallmedia…"
+info "Copies the installer to the USB and makes it bootable. Expect 10–20 minutes."
+run sudo "$INSTALLER_APP/Contents/Resources/createinstallmedia" \
+  --volume "/Volumes/$VOLNAME" --nointeraction \
+  || die "createinstallmedia failed. The USB is NOT bootable; re-run to try again."
+
+# Reclaim the ~16 GB downloaded installer .app (mist wrote it as root).
+[[ $DRY_RUN -eq 0 && -d "$APPDIR" ]] && run sudo rm -rf "$APPDIR"
 
 # ===========================================================================
 # 5. Verify + finish

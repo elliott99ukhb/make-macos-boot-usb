@@ -15,9 +15,9 @@ installer and writes the boot drive **unattended** (no clicking through a GUI).
    never be selected.
 3. **Checks capacity** against the *actual* installer size (recent installers are
    ~17 GB, so a 16 GB stick is rejected — use 32 GB).
-4. **Formats the drive**, then **downloads the full installer in the background**
-   and writes the bootable installer to it. After you enter your password once,
-   the whole thing runs unattended.
+4. **Downloads the full installer** in the background, **formats the drive**, and
+   writes it into a bootable installer with Apple's `createinstallmedia`. After you
+   enter your password once, the whole thing runs unattended.
 5. **Verifies** the result, tells you it's safe to boot from, shows the boot-key
    steps, and offers to eject.
 
@@ -108,20 +108,38 @@ destroyed.
 
 **Intel:** Hold the **Option/Alt** key at startup and select the installer drive.
 
+## Why not `mist … bootableinstaller`?
+
+`mist` *can* write the boot drive itself with its `bootableinstaller` output type,
+and earlier versions of this script used it. But on **macOS 26/27** that path fails
+at the final step with:
+
+> `Invalid Exit Status Code: '254' … is not a valid volume mount point`
+
+— because mist's wrapper around Apple's `createinstallmedia` mishandles the volume
+rename/remount. Apple's `createinstallmedia` itself works fine on the exact same
+drive and OS. So this script uses `mist` only for the reliable part (downloading
+the genuine full installer `.app`) and then calls `createinstallmedia` directly.
+
 ## Doing it manually
 
-If you'd rather run the underlying command yourself (for example, onto a volume
-you've already formatted as *Mac OS Extended (Journaled)* named `MacInstaller`):
+If you'd rather run the underlying two steps yourself (onto a volume you've already
+formatted as *Mac OS Extended (Journaled)* named `MacInstaller`):
 
 ```bash
-sudo mist download installer "<build>" bootableinstaller \
-  --bootable-installer-volume "/Volumes/MacInstaller" \
+# 1. Download the full installer .app with mist
+sudo mist download installer "<build>" application \
+  --output-directory ~/Downloads \
   --catalog-url "$(defaults read /Library/Preferences/com.apple.SoftwareUpdate CatalogURL)" \
   --include-betas
+
+# 2. Write it to the USB with Apple's own tool
+sudo "~/Downloads/Install macOS <name>.app/Contents/Resources/createinstallmedia" \
+  --volume /Volumes/MacInstaller --nointeraction
 ```
 
 Replace `<build>` with the build number from `mist list installer --include-betas`
-(e.g. `26A5368g` for macOS Golden Gate 27.0).
+(e.g. `26A5368g` for macOS Golden Gate 27.0), and `<name>` with the version name.
 
 ## License
 
